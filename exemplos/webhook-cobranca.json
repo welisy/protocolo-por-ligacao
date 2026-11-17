@@ -1,0 +1,9 @@
+{
+  "event_type": "answered",
+  "agent_id": "53",
+  "caller_number": "5511900000001",
+  "callee_number": "1130000000",
+  "correlation_id": "0b6f6d0e-1c1a-4f7e-9a51-000000000003",
+  "call_uuid": "5f2c9a7e-3d4b-4c8a-b1e2-000000000003",
+  "timestamp": "2026-10-01T14:03:12Z"
+}

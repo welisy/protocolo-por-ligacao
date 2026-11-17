@@ -1,0 +1,944 @@
+{
+  "name": "Protocolo por ligação atendida",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "protocolo-por-ligacao",
+        "options": {}
+      },
+      "id": "4b14adde-25f5-552b-80c8-cff0419fc070",
+      "name": "Webhook Chamada Atendida",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        0,
+        300
+      ],
+      "webhookId": "ec88a9d7-239a-5496-b5fe-763d48c0d07f"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ===== Configuração =====\n// Tudo que muda de um ambiente para outro fica aqui. Tokens NÃO: ficam nas credenciais do n8n.\n// mapaAgentes e agentesExcluidos saem prontos do workflow \"Gerar mapa de agentes\".\nconst config = {\n  telefoniaUrl: 'https://telefonia.exemplo.com',\n  helpdeskUrl: 'https://helpdesk.exemplo.com',\n  helpdeskTenant: 'exemplo',\n  clienteId: '2',                       // empresa padrão do ticket no helpdesk\n  servicoId: '39',                      // serviço / categoria do ticket\n  dominioContato: 'ura.exemplo.local',  // e-mail sintético do contato: <cpf>@<dominio>\n\n  // Agentes que não geram protocolo (ex.: equipe de cobrança).\n  agentesExcluidos: ['53', '54'],\n\n  // Agente da telefonia -> responsável (r) e equipe (t) no helpdesk.\n  mapaAgentes: {\n    '10': { r: '700', t: '1' },\n    '11': { r: '704', t: '10' },\n    '12': { r: '705', t: '1' },\n  },\n\n  janelaLigacaoMin: 30,   // quanto tempo as pernas de uma mesma ligação ficam agrupadas\n  reservaMaxSeg: 60,      // reserva sem ticket além disso = perna que falhou\n  esperaSeg: 5,           // espera entre tentativas da perna que aguarda o ticket\n  tentativasMax: 6,       // 6 x 5 s = até 30 s esperando a perna anterior\n};\n\nreturn [{ json: { ...$json, config } }];\n"
+      },
+      "id": "c025f0ba-9a88-5b2b-9fa3-0f1b72c645c7",
+      "name": "Config",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "57cef609-72f0-5e50-ba4d-c6b2bcbf68e2",
+              "leftValue": "={{ $json.body.event_type }}",
+              "rightValue": "answered",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            },
+            {
+              "id": "8203c924-d662-5503-89df-8b3da7ba3392",
+              "leftValue": "={{ $json.body.agent_id }}",
+              "rightValue": "None",
+              "operator": {
+                "type": "string",
+                "operation": "notEquals"
+              }
+            },
+            {
+              "id": "2e14749e-228a-51c9-9bb0-b9d875c09110",
+              "leftValue": "={{ $json.body.agent_id }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "1f48c063-7b79-510b-80e4-b7222c249372",
+      "name": "Só Atendidas",
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2,
+      "position": [
+        440,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.config.telefoniaUrl }}/api/v1/calls/{{ $json.body.correlation_id }}/info",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {}
+      },
+      "id": "dca71e57-bbbd-5f7f-bc55-1288f9ab3c2b",
+      "name": "Busca Dados da Chamada",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        660,
+        300
+      ],
+      "retryOnFail": true,
+      "waitBetweenTries": 500
+    },
+    {
+      "parameters": {
+        "jsCode": "// Junta o evento do webhook com os dados da chamada (CPF e empresa digitados na URA).\nconst { body = {}, config } = $('Config').first().json;\n\nlet cpf = '', empresa = '';\ntry {\n  const info = $input.first().json;\n  // a API devolve { data: \"<json em texto>\" } com call_info: [{ label, value }]\n  const dados = typeof info.data === 'string' ? JSON.parse(info.data) : (info.data || info);\n  for (const campo of (dados.call_info || [])) {\n    const label = String(campo.label || '').toLowerCase();\n    if (label === 'cpf') cpf = String(campo.value ?? '');\n    if (label === 'empresa') empresa = String(campo.value ?? '');\n  }\n} catch (e) {}\n\nlet cpfDigitos = cpf.replace(/\\D/g, '');\nconst telefone = String(body.caller_number || '');\n\n// Na transferência assistida, a 2ª perna tem outro correlation_id e a consulta não traz o CPF.\n// O elo entre as pernas é o telefone de quem ligou: guarda o CPF quando vem e recupera quando falta.\nconst estado = $getWorkflowStaticData('global');\nestado.cpfPorTelefone = estado.cpfPorTelefone || {};\nconst agora = Date.now();\nconst janela = config.janelaLigacaoMin * 60 * 1000;\nfor (const k of Object.keys(estado.cpfPorTelefone)) {\n  if (agora - estado.cpfPorTelefone[k].ts > janela) delete estado.cpfPorTelefone[k];\n}\nif (/^\\d{11}$/.test(cpfDigitos)) {\n  if (telefone) estado.cpfPorTelefone[telefone] = { cpf: cpfDigitos, empresa, ts: agora };\n} else if (telefone && estado.cpfPorTelefone[telefone]) {\n  cpfDigitos = estado.cpfPorTelefone[telefone].cpf;\n  empresa = empresa || estado.cpfPorTelefone[telefone].empresa || '';\n}\n\nconst agente = String(body.agent_id || '');\nreturn [{ json: {\n  telefone,\n  telefone_sem_ddi: telefone.replace(/^55/, ''),\n  agente,\n  excluido: config.agentesExcluidos.map(String).includes(agente),\n  cpf: cpfDigitos || 'não informado',\n  cpf_valido: /^\\d{11}$/.test(cpfDigitos),\n  empresa: empresa ? empresa.toUpperCase() : 'não informado',\n  correlation_id: String(body.correlation_id || ''),\n  call_uuid: String(body.call_uuid || ''),\n  timestamp: String(body.timestamp || ''),\n} }];\n"
+      },
+      "id": "09a08683-86e1-5e47-8e24-1657373807b2",
+      "name": "Prepara Chamada",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        880,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "dataToSave": {
+          "values": [
+            {
+              "key": "telefone",
+              "value": "={{ $json.telefone }}"
+            },
+            {
+              "key": "agente",
+              "value": "={{ $json.agente }}"
+            },
+            {
+              "key": "cpf_valido",
+              "value": "={{ $json.cpf_valido.toString() }}"
+            },
+            {
+              "key": "excluido",
+              "value": "={{ $json.excluido.toString() }}"
+            },
+            {
+              "key": "correlation_id",
+              "value": "={{ $json.correlation_id }}"
+            }
+          ]
+        }
+      },
+      "id": "f5924782-8725-552b-bad5-803af0233e19",
+      "name": "Log Entrada",
+      "type": "n8n-nodes-base.executionData",
+      "typeVersion": 1.1,
+      "position": [
+        1100,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "b045e221-745e-55ef-a14c-901ed5189072",
+              "leftValue": "={{ $json.cpf_valido }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            },
+            {
+              "id": "b8c3cc94-49fd-5982-a427-5ecb7f62e08c",
+              "leftValue": "={{ $json.excluido }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "false",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "f3c087ea-8f74-5da2-902f-2640b28f47ca",
+      "name": "Gera Protocolo?",
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2.3,
+      "position": [
+        1320,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// 1 protocolo por LIGAÇÃO, no agente que RECEBEU.\n//\n// Chave = telefone de quem ligou. É o único elo entre as pernas: na transferência assistida\n// cada perna chega com um correlation_id próprio, então agrupar por ele gera ticket duplicado.\n//\n// Saída no campo `acao`:\n//   criar     primeira perna da ligação\n//   atualizar perna seguinte: troca o responsável do ticket que já existe\n//   aguardar  a perna anterior ainda está criando o ticket; espera e tenta de novo\nconst { config } = $('Config').first().json;\nconst p = $json;\nconst chave = String(p.telefone || '');\nconst estado = $getWorkflowStaticData('global');\nestado.ligacoes = estado.ligacoes || {};\n\nconst agora = Date.now();\nconst JANELA = config.janelaLigacaoMin * 60 * 1000;\nconst RESERVA_MAX = config.reservaMaxSeg * 1000;\n\nfor (const k of Object.keys(estado.ligacoes)) {\n  if (agora - estado.ligacoes[k].ts > JANELA) delete estado.ligacoes[k];\n}\n\nconst tentativas = Number(p._tentativas || 0);\nconst saida = (acao, ticketId, t) => [{ json: { ...p, acao, ticket_id: String(ticketId || ''), _tentativas: t } }];\n\nif (!chave) return saida('criar', '', tentativas);       // sem telefone não dá para agrupar\n\nconst reg = estado.ligacoes[chave];\n\n// Primeira perna: reserva a chave na hora. As pernas chegam com ~1 s de diferença, menos\n// que o tempo de criar o ticket, então a seguinte precisa enxergar a ligação em andamento.\nif (!reg) {\n  estado.ligacoes[chave] = { ticket_id: '', ts: agora };\n  return saida('criar', '', tentativas);\n}\n\n// Já tem ticket: atualiza. O ts é renovado a cada perna (janela deslizante) para\n// aguentar ligação longa com várias transferências.\nif (reg.ticket_id) {\n  reg.ts = agora;\n  return saida('atualizar', reg.ticket_id, tentativas);\n}\n\n// Reserva órfã (a perna anterior falhou antes de criar) ou espera longa demais:\n// melhor um ticket a mais do que uma ligação sem protocolo.\nif (tentativas >= config.tentativasMax || (agora - reg.ts) > RESERVA_MAX) {\n  estado.ligacoes[chave] = { ticket_id: '', ts: agora };\n  return saida('criar', '', tentativas);\n}\n\nreturn saida('aguardar', '', tentativas + 1);\n"
+      },
+      "id": "6e32ba75-5870-5331-b4ca-fe8b800afb14",
+      "name": "Anti-duplicado",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1540,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Agente da telefonia -> responsável + equipe no helpdesk (mapa no nó Config).\nconst { config } = $('Config').first().json;\n\n// O helpdesk faz FIND-OR-CREATE nesses campos: valor não numérico não dá erro, ele CRIA\n// uma equipe ou um responsável com aquele texto de nome. Daqui para frente, só dígitos.\nconst num = (v) => /^\\d+$/.test(String(v ?? '')) ? String(v) : '';\n\nconst p = $json;\nconst m = config.mapaAgentes[String(p.agente)] || {};\nconst r = num(m.r), t = num(m.t);\nconst ok = Boolean(r && t);   // o responsável precisa da equipe dele; sem os dois, fica sem dono (fila do serviço)\n\n// Num ticket que já existe, enviar o campo vazio APAGA o responsável atual.\n// Sem agente resolvido, a perna seguinte não encosta no ticket.\nconst acao = (p.acao === 'atualizar' && !ok) ? 'ignorar' : p.acao;\n\nreturn [{ json: { ...p, acao, responsible_id: ok ? r : '', team_id: ok ? t : '' } }];\n"
+      },
+      "id": "f4d7e6a7-941a-58e4-934d-d0fcaaf5141e",
+      "name": "Resolve Agente",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1760,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "d9771a91-625d-562b-9626-c35c35553612",
+                    "leftValue": "={{ $json.acao }}",
+                    "rightValue": "criar",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "criar"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "7ac41b2a-7714-516c-9632-e3cfc1cdd190",
+                    "leftValue": "={{ $json.acao }}",
+                    "rightValue": "atualizar",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "atualizar"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "23b3164f-686c-5ced-b1f3-8fcc9c8fc8fa",
+                    "leftValue": "={{ $json.acao }}",
+                    "rightValue": "aguardar",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "aguardar"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "2e4371fb-8f5b-5d14-a8fb-331a33c7aaec",
+                    "leftValue": "={{ $json.acao }}",
+                    "rightValue": "ignorar",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "ignorar"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "785d0015-68de-5515-b5a2-38b7e767588c",
+      "name": "Ação?",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        1980,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "amount": "={{ $('Config').first().json.config.esperaSeg }}",
+        "unit": "seconds"
+      },
+      "id": "38d9877a-4a60-5b87-94f6-855abf68e309",
+      "name": "Aguarda Ticket",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        2200,
+        680
+      ],
+      "webhookId": "bff4d4f0-4483-55fa-8add-2ba6068fb5e7"
+    },
+    {
+      "parameters": {
+        "url": "={{ $('Config').first().json.config.helpdeskUrl }}/api/v1/contacts",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpQueryAuth",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "email",
+              "value": "={{ $('Prepara Chamada').item.json.cpf }}@{{ $('Config').first().json.config.dominioContato }}"
+            },
+            {
+              "name": "fields",
+              "value": "id,email,title"
+            },
+            {
+              "name": "length",
+              "value": "1"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Tenant-ID",
+              "value": "={{ $('Config').first().json.config.helpdeskTenant }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "2e3dd0e4-055f-5c13-8b32-2cbfeef63f83",
+      "name": "Busca Contato",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        2200,
+        260
+      ],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "2e4bb3aa-ed1a-5e30-b50c-7a602dd09901",
+              "leftValue": "={{ $json.id }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "8e0c34e3-ded4-5845-b646-823b5f04375e",
+      "name": "Contato existe?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        2420,
+        260
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Config').first().json.config.helpdeskUrl }}/api/v1/contacts",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpQueryAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/x-www-form-urlencoded"
+            },
+            {
+              "name": "X-Tenant-ID",
+              "value": "={{ $('Config').first().json.config.helpdeskTenant }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "form-urlencoded",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "fullname",
+              "value": "=Cliente URA {{ $('Prepara Chamada').item.json.empresa }} - CPF {{ $('Prepara Chamada').item.json.cpf }}"
+            },
+            {
+              "name": "email",
+              "value": "={{ $('Prepara Chamada').item.json.cpf }}@{{ $('Config').first().json.config.dominioContato }}"
+            },
+            {
+              "name": "code",
+              "value": "={{ $('Prepara Chamada').item.json.cpf }}"
+            },
+            {
+              "name": "cellphone",
+              "value": "={{ $('Prepara Chamada').item.json.telefone_sem_ddi }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "daa4f2f9-f605-5e65-8ffe-89859b524b7a",
+      "name": "Cria Contato",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        2640,
+        440
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Config').first().json.config.helpdeskUrl }}/api/v1/issues",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpQueryAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/x-www-form-urlencoded"
+            },
+            {
+              "name": "X-Tenant-ID",
+              "value": "={{ $('Config').first().json.config.helpdeskTenant }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "form-urlencoded",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "customers",
+              "value": "={{ $('Config').first().json.config.clienteId }}"
+            },
+            {
+              "name": "services",
+              "value": "={{ $('Config').first().json.config.servicoId }}"
+            },
+            {
+              "name": "contacts",
+              "value": "={{ $json.id }}"
+            },
+            {
+              "name": "responsible_id",
+              "value": "={{ $('Resolve Agente').item.json.responsible_id }}"
+            },
+            {
+              "name": "team_id",
+              "value": "={{ $('Resolve Agente').item.json.team_id }}"
+            },
+            {
+              "name": "title",
+              "value": "=Ligação atendida - {{ $('Prepara Chamada').item.json.empresa }}"
+            },
+            {
+              "name": "htmlcontent",
+              "value": "=Cliente passou pela URA e foi atendido.<br>URA: {{ $('Prepara Chamada').item.json.empresa }}<br>Contato: {{ $json.title }}<br>Telefone: {{ $('Prepara Chamada').item.json.telefone_sem_ddi }}<br>CPF: {{ $('Prepara Chamada').item.json.cpf }}<br>Data/hora: {{ $('Prepara Chamada').item.json.timestamp }}<br>Correlation ID: {{ $('Prepara Chamada').item.json.correlation_id }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "1b71c71f-b5cb-5845-8c8a-c17a4066877d",
+      "name": "Cria Ticket",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        2860,
+        260
+      ],
+      "retryOnFail": true,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "jsCode": "// Grava o id do ticket na reserva feita pelo Anti-duplicado, para a perna seguinte\n// da mesma ligação encontrar o ticket e ATUALIZAR em vez de criar outro.\nconst ticket = $json;\nconst chave = String($('Prepara Chamada').first().json.telefone || '');\nconst estado = $getWorkflowStaticData('global');\nestado.ligacoes = estado.ligacoes || {};\nif (chave) estado.ligacoes[chave] = { ticket_id: String(ticket.id || ''), ts: Date.now() };\nreturn [{ json: ticket }];\n"
+      },
+      "id": "65dfbbcd-3784-53aa-a257-62b5e55e9f42",
+      "name": "Registra Ticket",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3080,
+        260
+      ]
+    },
+    {
+      "parameters": {
+        "method": "PUT",
+        "url": "={{ $('Config').first().json.config.helpdeskUrl }}/api/v1/issues/{{ $json.ticket_id }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpQueryAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/x-www-form-urlencoded"
+            },
+            {
+              "name": "X-Tenant-ID",
+              "value": "={{ $('Config').first().json.config.helpdeskTenant }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "form-urlencoded",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "responsible_id",
+              "value": "={{ $json.responsible_id }}"
+            },
+            {
+              "name": "team_id",
+              "value": "={{ $json.team_id }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "067d2fef-4fc1-5878-a142-883de4750218",
+      "name": "Atualiza Ticket",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        2200,
+        40
+      ],
+      "retryOnFail": true,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "dataToSave": {
+          "values": [
+            {
+              "key": "acao",
+              "value": "={{ $('Resolve Agente').item.json.acao }}"
+            },
+            {
+              "key": "ticket_id",
+              "value": "={{ $json.id || $json.ticket_id || '' }}"
+            },
+            {
+              "key": "responsible_id",
+              "value": "={{ $('Resolve Agente').item.json.responsible_id }}"
+            },
+            {
+              "key": "telefone",
+              "value": "={{ $('Prepara Chamada').item.json.telefone }}"
+            }
+          ]
+        }
+      },
+      "id": "1ba577dd-5b3e-51fa-8145-5f737722c150",
+      "name": "Log Ticket",
+      "type": "n8n-nodes-base.executionData",
+      "typeVersion": 1.1,
+      "position": [
+        3300,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "content": "# Protocolo por ligação atendida\n\n**1 protocolo por ligação, no agente que RECEBEU**, mesmo com transferência.\n\n`Webhook → Config → Só Atendidas → Busca Dados da Chamada → Prepara Chamada → Gera Protocolo? → Anti-duplicado → Resolve Agente → Ação?`\n\nAção: **criar** (contato + ticket) · **atualizar** (troca o responsável) · **aguardar** (5 s e tenta de novo) · **ignorar**.\n\n⚠️ O estado entre execuções (`$getWorkflowStaticData`) só persiste com o workflow **ativo**. Execução manual no editor não guarda nada.",
+        "height": 300,
+        "width": 900
+      },
+      "id": "5656e051-fd7d-51a3-b643-6150e7e46016",
+      "name": "Nota - Visão geral",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -40,
+        -260
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### Config\nURLs, ids do helpdesk, **mapa de agentes** e **agentes excluídos**.\nOs dois últimos saem prontos do workflow *Gerar mapa de agentes*: rode, copie e cole aqui.\nTokens ficam nas credenciais, nunca neste nó.",
+        "height": 200,
+        "width": 420,
+        "color": 5
+      },
+      "id": "b02ca834-1054-543a-9965-402f16f9dba2",
+      "name": "Nota - Config",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        180,
+        480
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### Por que agrupar pelo telefone\nNa transferência assistida cada perna chega com um `correlation_id` próprio e a 2ª perna não traz o CPF.\nO único elo entre elas é o **telefone de quem ligou**.\n\nAs pernas chegam com ~1 s de diferença, menos que o tempo de criar o ticket: a 1ª **reserva** a ligação antes de criar, e a 2ª **aguarda** o id do ticket para **atualizar** o responsável.",
+        "height": 340,
+        "width": 460,
+        "color": 3
+      },
+      "id": "131472b2-c48c-5722-8fa8-efbe010d6863",
+      "name": "Nota - Anti-duplicado",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1500,
+        -120
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### Armadilhas do helpdesk\n• **Find-or-create** em `team_id` / `responsible_id`: texto não numérico CRIA uma equipe com esse nome. Por isso o *Resolve Agente* só deixa passar dígitos.\n• **PUT com campo vazio apaga** o valor atual. Sem agente mapeado, a perna seguinte vira *ignorar*.\n• `responsible_id` exige o `team_id` da **mesma** equipe.\n• Contato sem e-mail real: e-mail sintético `<cpf>@<dominio>`, que também serve de chave de busca.",
+        "height": 320,
+        "width": 560,
+        "color": 2
+      },
+      "id": "8e1084e6-71d1-5a33-8fe8-aa2351fe0d91",
+      "name": "Nota - Helpdesk",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        2580,
+        -320
+      ]
+    }
+  ],
+  "pinData": {
+    "Webhook Chamada Atendida": [
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "event_type": "answered",
+            "agent_id": "10",
+            "caller_number": "5511900000001",
+            "callee_number": "1130000000",
+            "correlation_id": "0b6f6d0e-1c1a-4f7e-9a51-000000000001",
+            "call_uuid": "5f2c9a7e-3d4b-4c8a-b1e2-000000000001",
+            "timestamp": "2026-10-01T14:03:12Z"
+          }
+        }
+      }
+    ]
+  },
+  "connections": {
+    "Webhook Chamada Atendida": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "Só Atendidas",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Só Atendidas": {
+      "main": [
+        [
+          {
+            "node": "Busca Dados da Chamada",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Busca Dados da Chamada": {
+      "main": [
+        [
+          {
+            "node": "Prepara Chamada",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepara Chamada": {
+      "main": [
+        [
+          {
+            "node": "Log Entrada",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Entrada": {
+      "main": [
+        [
+          {
+            "node": "Gera Protocolo?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gera Protocolo?": {
+      "main": [
+        [
+          {
+            "node": "Anti-duplicado",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Anti-duplicado": {
+      "main": [
+        [
+          {
+            "node": "Resolve Agente",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resolve Agente": {
+      "main": [
+        [
+          {
+            "node": "Ação?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ação?": {
+      "main": [
+        [
+          {
+            "node": "Busca Contato",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Atualiza Ticket",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Aguarda Ticket",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Log Ticket",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Aguarda Ticket": {
+      "main": [
+        [
+          {
+            "node": "Anti-duplicado",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Busca Contato": {
+      "main": [
+        [
+          {
+            "node": "Contato existe?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Contato existe?": {
+      "main": [
+        [
+          {
+            "node": "Cria Ticket",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Cria Contato",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cria Contato": {
+      "main": [
+        [
+          {
+            "node": "Cria Ticket",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cria Ticket": {
+      "main": [
+        [
+          {
+            "node": "Registra Ticket",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Registra Ticket": {
+      "main": [
+        [
+          {
+            "node": "Log Ticket",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Atualiza Ticket": {
+      "main": [
+        [
+          {
+            "node": "Log Ticket",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": []
+}

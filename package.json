@@ -1,0 +1,13 @@
+{
+  "name": "protocolo-por-ligacao",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Workflow n8n que abre um protocolo no helpdesk por ligação atendida, inclusive em transferências.",
+  "license": "MIT",
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

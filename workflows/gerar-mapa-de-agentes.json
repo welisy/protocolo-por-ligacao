@@ -1,0 +1,160 @@
+{
+  "name": "Gerar mapa de agentes",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "616ed83b-6e93-5d3e-9b7d-1982a5db99c6",
+      "name": "Gerar Mapa (manual)",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "url": "https://telefonia.exemplo.com/api/v1/agents",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "pagination": {
+            "pagination": {
+              "parameters": {
+                "parameters": [
+                  {
+                    "name": "page",
+                    "value": "={{ $pageCount + 1 }}"
+                  }
+                ]
+              },
+              "paginationCompleteWhen": "other",
+              "completeExpression": "={{ $response.body.data.length === 0 }}",
+              "limitPagesFetched": true,
+              "maxRequests": 10
+            }
+          }
+        }
+      },
+      "id": "3682c406-47f6-566d-9f3d-98b62b76467e",
+      "name": "Agentes Telefonia",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        220,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "url": "https://helpdesk.exemplo.com/api/v1/agents",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpQueryAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Tenant-ID",
+              "value": "exemplo"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "188c3669-a300-543c-b850-75aae5c58ad8",
+      "name": "Agentes Helpdesk",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        440,
+        300
+      ],
+      "executeOnce": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Gera o mapaAgentes e a lista agentesExcluidos para colar no nó Config do fluxo principal.\n// Casamento em cascata: e-mail -> login -> nome normalizado -> AJUSTES manuais.\n\nconst FILA_EXCLUIDA = '87';   // id da fila cujos agentes não geram protocolo (ex.: cobrança)\n// Ajustes para quem não casa sozinho: { '<agente telefonia>': { r: '<responsável>', t: '<equipe>' } }\nconst AJUSTES = {};\n\nconst email = (s) => String(s || '').trim().toLowerCase();\nconst chave = (s) => String(s || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[^a-z0-9]/g, '');\nconst equipe = (a) => { const t = (a.teams && typeof a.teams === 'object') ? Object.keys(a.teams) : []; return t.length ? String(t[0]) : ''; };\n\n// A telefonia é paginada: junta TODAS as páginas (uma página só = agentes sumindo do mapa).\nlet telefonia = [];\nfor (const pagina of $('Agentes Telefonia').all().map(i => i.json)) {\n  telefonia = telefonia.concat(Array.isArray(pagina) ? pagina : (pagina.data || []));\n}\nconst resp = $('Agentes Helpdesk').all().map(i => i.json);\nconst helpdesk = (resp.length === 1 && Array.isArray(resp[0])) ? resp[0] : resp;\n\nconst porEmail = {}, porLogin = {}, porNome = {};\nfor (const a of helpdesk) {\n  if (a.status_id && String(a.status_id) !== '2') continue;   // só agentes ativos\n  const alvo = { r: String(a.id), t: equipe(a) };\n  if (a.email) porEmail[email(a.email)] = alvo;\n  if (a.username) porLogin[chave(a.username)] = alvo;\n  const nome = a.fullname || a.title;\n  if (nome) porNome[chave(nome)] = alvo;\n}\n\nconst mapaAgentes = {}, semMatch = [];\nfor (const a of telefonia) {\n  if (a.archived) continue;\n  const achado = AJUSTES[a.id]\n    || (a.email && porEmail[email(a.email)])\n    || (a.login && porLogin[chave(a.login)])\n    || (a.name && porNome[chave(a.name)])\n    || null;\n  if (achado && achado.r) mapaAgentes[String(a.id)] = { r: achado.r, t: achado.t || '' };\n  else semMatch.push({ id: a.id, nome: a.name });\n}\n\nconst agentesExcluidos = telefonia\n  .filter(a => !a.archived && Array.isArray(a.queues) && a.queues.map(String).includes(FILA_EXCLUIDA))\n  .map(a => String(a.id));\n\nreturn [{ json: { mapeados: Object.keys(mapaAgentes).length, sem_match: semMatch, mapaAgentes, agentesExcluidos } }];\n"
+      },
+      "id": "5c117350-8bb5-5231-abb1-c5afb3dfa69a",
+      "name": "Monta Mapa",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        660,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "content": "# Gerar mapa de agentes\nCasa os agentes da telefonia com os do helpdesk (e-mail → login → nome normalizado → ajustes manuais) e lista os agentes da fila excluída.\n\n**Rode manualmente** e cole `mapaAgentes` e `agentesExcluidos` no nó **Config** do fluxo principal. Repita quando entrarem agentes novos (agente fora do mapa = ticket sem dono).",
+        "height": 260,
+        "width": 620
+      },
+      "id": "7a38b0a3-73e5-5d16-a69e-88b303012c21",
+      "name": "Nota - Sync",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -40,
+        -40
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### Armadilhas\n• A lista de agentes da telefonia é **paginada** (50 por página). Sem paginação, os agentes das páginas seguintes somem do mapa.\n• *Agentes Helpdesk* com **Execute Once**: senão dispara uma requisição por página recebida e estoura o limite (429).\n• Não restrinja `fields` na busca do helpdesk: sem o campo `teams`, a equipe fica vazia.",
+        "height": 260,
+        "width": 460,
+        "color": 3
+      },
+      "id": "e3f72cc5-c535-50ef-8640-1394fc22ddae",
+      "name": "Nota - Sync armadilhas",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        620,
+        -40
+      ]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Gerar Mapa (manual)": {
+      "main": [
+        [
+          {
+            "node": "Agentes Telefonia",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Agentes Telefonia": {
+      "main": [
+        [
+          {
+            "node": "Agentes Helpdesk",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Agentes Helpdesk": {
+      "main": [
+        [
+          {
+            "node": "Monta Mapa",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": []
+}
